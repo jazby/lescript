@@ -3,17 +3,24 @@ namespace Jazby\Lescript;
 
 class Lescript
 {
+    const CHALLENGE_URL = '.well-known/acme-challenge';
+
     public $ca = 'https://acme-v01.api.letsencrypt.org';
     // public $ca = 'https://acme-staging.api.letsencrypt.org'; // testing
     public $license = 'https://letsencrypt.org/documents/LE-SA-v1.0.1-July-27-2015.pdf';
     public $countryCode = 'CZ';
     public $state = "Czech Republic";
+    /** @var callable $domainChallengeStartCallback function(array $domain) */
+    protected $domainChallengeStartCallback;
+    /** @var callable $domainChallengeStartCallback function(array $domain) */
+    protected $domainChallengeEndCallback;
     private $certificatesDir;
     private $webRootDir;
     /** @var \Psr\Log\LoggerInterface */
     private $logger;
     private $client;
     private $accountKeyPath;
+    private $fileClient;
 
     public function __construct($certificatesDir, $webRootDir, $logger = null)
     {
@@ -21,6 +28,7 @@ class Lescript
         $this->webRootDir = $webRootDir;
         $this->logger = $logger;
         $this->client = new Client($this->ca);
+        $this->fileClient = new FileClient();
         $this->accountKeyPath = $certificatesDir . '/_account/private.pem';
     }
 
@@ -45,67 +53,41 @@ class Lescript
     {
         $this->log('Starting certificate generation process for domains');
 
-        $privateAccountKey = $this->readPrivateKey($this->accountKeyPath);
-        $accountKeyDetails = openssl_pkey_get_details($privateAccountKey);
-
         // start domains authentication
         // ----------------------------
+        foreach ($domains as &$domain) {
+            // remap array to request format -> for future use
+            if (is_array($domain) && !isset($domain['name'])) {
+                throw new \RuntimeException('Please fill input domains array correctly (domain.tld, www.domain.tld etc.)');
+            } elseif (!is_array($domain)) {
+                $domain = ['name' => $domain];
+            }
 
-        foreach ($domains as $domain) {
+            if (filter_var($domain['name'], FILTER_VALIDATE_URL) !== false) {
+                throw new \RuntimeException('Please fill input domains without protocol (domain.tld instead od http(s)://domain.tld etc.)');
+            }
+
+            // 0. if you need action before sign started, calling callback method
+            if (is_callable($this->domainChallengeStartCallback)) {
+                call_user_func($this->domainChallengeStartCallback, $domain);
+            }
 
             // 1. getting available authentication options
             // -------------------------------------------
+            $challenge = $this->getChallengeToken($domain);
 
-            $this->log("Requesting challenge for $domain");
-
-            $response = $this->signedRequest(
-                "/acme/new-authz",
-                ["resource" => "new-authz", "identifier" => ["type" => "dns", "value" => $domain]]
-            );
-
-            // choose http-01 challange only
-            $challenge = array_reduce($response['challenges'], function ($v, $w) {
-                return $v ? $v : ($w['type'] == 'http-01' ? $w : false);
-            });
-            if (!$challenge) {
-                throw new \RuntimeException("HTTP Challenge for $domain is not available. Whole response: " . json_encode($response));
-            }
-
-            $this->log("Got challenge token for $domain");
             $location = $this->client->getLastLocation();
 
             // 2. saving authentication token for web verification
             // ---------------------------------------------------
-
-            $directory = $this->webRootDir . '/.well-known/acme-challenge';
-            $tokenPath = $directory . '/' . $challenge['token'];
-
-            if (!file_exists($directory) && !@mkdir($directory, 0755, true)) {
-                throw new \RuntimeException("Couldn't create directory to expose challenge: ${tokenPath}");
-            }
-
-            $header = [
-                // need to be in precise order!
-                "e" => Base64UrlSafeEncoder::encode($accountKeyDetails["rsa"]["e"]),
-                "kty" => "RSA",
-                "n" => Base64UrlSafeEncoder::encode($accountKeyDetails["rsa"]["n"])
-
-            ];
-            $payload = $challenge['token'] . '.' . Base64UrlSafeEncoder::encode(hash('sha256', json_encode($header), true));
-
-            file_put_contents($tokenPath, $payload);
-            chmod($tokenPath, 0644);
+            $payload = $this->uploadToken($domain, $challenge['token']);
 
             // 3. verification process itself
             // -------------------------------
-
-            $uri = "http://${domain}/.well-known/acme-challenge/${challenge['token']}";
-
-            $this->log("Token for $domain saved at $tokenPath and should be available at $uri");
-
-            // simple self check
-            if ($payload !== trim(@file_get_contents($uri))) {
-                throw new \RuntimeException("Please check $uri - token not available");
+            try {
+                $this->verifyDomainToken($domain, $challenge['token'], $payload);
+            } catch (\Exception $e) {
+                throw $e;
             }
 
             $this->log("Sending request to challenge");
@@ -137,32 +119,17 @@ class Lescript
             } while (!$ended);
 
             $this->log("Verification ended with status: ${result['status']}");
-            @unlink($tokenPath);
+            $this->removeToken($domain, $challenge['token']);
+
+            // 4. if you need action before sign started, calling callback method
+            if (is_callable($this->domainChallengeEndCallback)) {
+                call_user_func($this->domainChallengeEndCallback, $domain);
+            }
         }
 
         // requesting certificate
         // ----------------------
-        $domainPath = $this->getDomainPath(reset($domains));
-
-        // generate private key for domain if not exist
-        if (!is_dir($domainPath) || !is_file($domainPath . '/private.pem')) {
-            $this->generateKey($domainPath);
-        }
-
-        // load domain key
-        $privateDomainKey = $this->readPrivateKey($domainPath . '/private.pem');
-
-        $this->client->getLastLinks();
-
-        $csr = $reuseCsr && is_file($domainPath . "/last.csr") ?
-            $this->getCsrContent($domainPath . "/last.csr") :
-            $this->generateCSR($privateDomainKey, $domains);
-
-        // request certificates creation
-        $result = $this->signedRequest(
-            "/acme/new-cert",
-            ['resource' => 'new-cert', 'csr' => $csr]
-        );
+        $result = $this->requestCertificate($domains, $reuseCsr);
         if ($this->client->getLastCode() !== 201) {
             throw new \RuntimeException("Invalid response code: " . $this->client->getLastCode() . ", " . json_encode($result));
         }
@@ -203,16 +170,12 @@ class Lescript
             throw new \RuntimeException('No certificates generated');
         }
 
-        $this->log("Saving fullchain.pem");
-        file_put_contents($domainPath . '/fullchain.pem', implode("\n", $certificates));
+        // and save certificates
+        $this->saveCertificates($domains, $certificates);
 
-        $this->log("Saving cert.pem");
-        file_put_contents($domainPath . '/cert.pem', array_shift($certificates));
+        $this->log("Done.");
 
-        $this->log("Saving chain.pem");
-        file_put_contents($domainPath . "/chain.pem", implode("\n", $certificates));
-
-        $this->log("Done !!§§!");
+        return $certificates;
     }
 
     private function readPrivateKey($path)
@@ -248,9 +211,9 @@ class Lescript
 
     private function generateCSR($privateKey, array $domains)
     {
-        $domain = reset($domains);
+        $domain = reset($domains)['name'];
         $san = implode(",", array_map(function ($dns) {
-            return "DNS:" . $dns;
+            return "DNS:" . $dns['name'];
         }, $domains));
         $tmpConf = tmpfile();
         $tmpConfMeta = stream_get_meta_data($tmpConf);
@@ -375,5 +338,146 @@ keyUsage = nonRepudiation, digitalSignature, keyEncipherment');
         } else {
             echo $message . "\n";
         }
+    }
+
+    /**
+     * @param string $state
+     */
+    public function setState($state)
+    {
+        $this->state = $state;
+    }
+
+    /**
+     * @param string $countryCode
+     */
+    public function setCountryCode($countryCode)
+    {
+        $this->countryCode = $countryCode;
+    }
+
+    /**
+     * @param string $ca
+     */
+    public function setUrl($ca)
+    {
+        $this->ca = $ca;
+    }
+
+    /**
+     * @param array $domain
+     * @return mixed|string
+     */
+    protected function getChallengeToken(array $domain)
+    {
+        $this->log("Requesting challenge for ${domain['name']}");
+
+        $response = $this->signedRequest(
+            "/acme/new-authz",
+            ["resource" => "new-authz", "identifier" => ["type" => "dns", "value" => $domain['name']]]
+        );
+
+        // choose http-01 challenge only
+        $challenge = array_reduce($response['challenges'], function ($v, $w) {
+            return $v ? $v : ($w['type'] == 'http-01' ? $w : false);
+        });
+        if (!$challenge) {
+            throw new \RuntimeException("HTTP Challenge for ${domain['name']} is not available. Whole response: " . json_encode($response));
+        }
+
+        $this->log("Got challenge token for ${domain['name']}");
+
+        return $response;
+    }
+
+    protected function uploadToken(array $domain, $token)
+    {
+        $privateAccountKey = $this->readPrivateKey($this->accountKeyPath);
+        $accountKeyDetails = openssl_pkey_get_details($privateAccountKey);
+
+        $directory = $this->webRootDir . self::CHALLENGE_URL;
+        $tokenPath = $directory . '/' . $token;
+
+        try {
+            $this->fileClient->isDirectory($directory);
+        } catch (\Exception $e) {
+            throw new \RuntimeException("Couldn't create directory to expose challenge: ${tokenPath}");
+        }
+
+        $header = [
+            // need to be in precise order!
+            "e" => Base64UrlSafeEncoder::encode($accountKeyDetails["rsa"]["e"]),
+            "kty" => "RSA",
+            "n" => Base64UrlSafeEncoder::encode($accountKeyDetails["rsa"]["n"])
+
+        ];
+        $payload = $token . '.' . Base64UrlSafeEncoder::encode(hash('sha256', json_encode($header), true));
+
+        $this->fileClient->writeContent($tokenPath, $payload);
+
+        $uri = "http://${domain['name']}/" . self::CHALLENGE_URL . "/${token}";
+        $this->log("Token for ${domain['name']} saved at $tokenPath and should be available at $uri");
+
+        return $payload;
+    }
+
+    protected function requestCertificate(array $domains, $reuseCsr)
+    {
+        $domainPath = $this->getDomainPath(reset($domains)['name']);
+
+        // generate private key for domain if not exist
+        try {
+            $this->fileClient->isFile($domainPath, 'private.pem');
+        } catch (\Exception $e) {
+            $this->generateKey($domainPath);
+        }
+
+        // load domain key
+        $privateDomainKey = $this->readPrivateKey($domainPath . '/private.pem');
+
+        $this->client->getLastLinks();
+
+        $csr = $reuseCsr && is_file($domainPath . "/last.csr") ?
+            $this->getCsrContent($domainPath . "/last.csr") :
+            $this->generateCSR($privateDomainKey, $domains);
+
+        // request certificates creation
+        return $this->signedRequest(
+            "/acme/new-cert",
+            ['resource' => 'new-cert', 'csr' => $csr]
+        );
+    }
+
+    protected function saveCertificates(array $domains, $certificates)
+    {
+        $domainPath = $this->getDomainPath(reset($domains)['name']);
+
+        $this->log("Saving fullchain.pem");
+        $this->fileClient->writeContent($domainPath . '/fullchain.pem', implode("\n", $certificates));
+
+        $this->log("Saving cert.pem");
+        $this->fileClient->writeContent($domainPath . '/cert.pem', array_shift($certificates));
+
+        $this->log("Saving chain.pem");
+        $this->fileClient->writeContent($domainPath . "/chain.pem", implode("\n", $certificates));
+    }
+
+    protected function verifyDomainToken(array $domain, $token, $response)
+    {
+        $uri = "http://${domain['name']}/" . self::CHALLENGE_URL . "/${token}";
+
+        if ($response !== trim(@file_get_contents($uri))) {
+            throw new \RuntimeException("Please check $uri - token not available");
+        }
+        return true;
+    }
+
+    protected function removeToken(array $domain, $token)
+    {
+        $tokenPath = $this->webRootDir . self::CHALLENGE_URL . '/' . $token;
+
+        $this->fileClient->removeFile($tokenPath);
+
+        $this->log("Token for ${domain['name']} removed from $tokenPath");
     }
 }
