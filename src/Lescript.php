@@ -14,13 +14,15 @@ class Lescript
     protected $domainChallengeStartCallback;
     /** @var callable $domainChallengeStartCallback function(array $domain) */
     protected $domainChallengeEndCallback;
-    private $certificatesDir;
-    private $webRootDir;
+    protected $certificatesDir;
+    protected $webRootDir;
+    protected $accountKeyPath;
+    /** @var Client */
+    protected $client;
+    /** @var FileClient */
+    protected $fileClient;
     /** @var \Psr\Log\LoggerInterface */
     private $logger;
-    private $client;
-    private $accountKeyPath;
-    private $fileClient;
 
     public function __construct($certificatesDir, $webRootDir, $logger = null)
     {
@@ -183,7 +185,7 @@ class Lescript
         return $certificates;
     }
 
-    private function readPrivateKey($path)
+    protected function readPrivateKey($path)
     {
         if (($key = openssl_pkey_get_private('file://' . $path)) === false) {
             throw new \RuntimeException(openssl_error_string());
@@ -192,19 +194,19 @@ class Lescript
         return $key;
     }
 
-    private function parsePemFromBody($body)
+    protected function parsePemFromBody($body)
     {
         $pem = chunk_split(base64_encode($body), 64, "\n");
 
         return "-----BEGIN CERTIFICATE-----\n" . $pem . "-----END CERTIFICATE-----\n";
     }
 
-    private function getDomainPath($domain)
+    protected function getDomainPath($domain)
     {
         return $this->certificatesDir . '/' . $domain . '/';
     }
 
-    private function postNewReg()
+    protected function postNewReg()
     {
         $this->log('Sending registration to letsencrypt server');
 
@@ -214,7 +216,7 @@ class Lescript
         );
     }
 
-    private function generateCSR($privateKey, array $domains)
+    protected function generateCSR($privateKey, array $domains)
     {
         $domain = reset($domains)['name'];
         $san = implode(",", array_map(function ($dns) {
@@ -267,7 +269,7 @@ keyUsage = nonRepudiation, digitalSignature, keyEncipherment');
         return $this->getCsrContent($csrPath);
     }
 
-    private function getCsrContent($csrPath)
+    protected function getCsrContent($csrPath)
     {
         $csr = file_get_contents($csrPath);
 
@@ -276,7 +278,7 @@ keyUsage = nonRepudiation, digitalSignature, keyEncipherment');
         return trim(Base64UrlSafeEncoder::encode(base64_decode($matches[1])));
     }
 
-    private function generateKey($outputDirectory)
+    protected function generateKey($outputDirectory)
     {
         $res = openssl_pkey_new([
             "private_key_type" => OPENSSL_KEYTYPE_RSA,
@@ -300,7 +302,7 @@ keyUsage = nonRepudiation, digitalSignature, keyEncipherment');
         file_put_contents($outputDirectory . '/public.pem', $details['key']);
     }
 
-    private function signedRequest($uri, array $payload)
+    protected function signedRequest($uri, array $payload)
     {
         $privateKey = $this->readPrivateKey($this->accountKeyPath);
         $details = openssl_pkey_get_details($privateKey);
