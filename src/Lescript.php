@@ -57,15 +57,8 @@ class Lescript
 
         // start domains authentication
         // ----------------------------
-        foreach ($domains as &$domain) {
-            // remap array to request format -> for future use
-            if (is_array($domain) && !isset($domain['name'])) {
-                throw new \RuntimeException('Please fill input domains array correctly (domain.tld, www.domain.tld etc.)');
-            } elseif (!is_array($domain)) {
-                $domain = ['name' => $domain];
-            }
-
-            if (filter_var($domain['name'], FILTER_VALIDATE_URL) !== false) {
+        foreach ($domains as $domain) {
+            if (filter_var($domain, FILTER_VALIDATE_URL) !== false) {
                 throw new \RuntimeException('Please fill input domains without protocol (domain.tld instead od http(s)://domain.tld etc.)');
             }
 
@@ -218,9 +211,9 @@ class Lescript
 
     protected function generateCSR($privateKey, array $domains)
     {
-        $domain = reset($domains)['name'];
+        $domain = reset($domains);
         $san = implode(",", array_map(function ($dns) {
-            return "DNS:" . $dns['name'];
+            return "DNS:" . $dns;
         }, $domains));
         $tmpConf = tmpfile();
         $tmpConfMeta = stream_get_meta_data($tmpConf);
@@ -377,16 +370,16 @@ keyUsage = nonRepudiation, digitalSignature, keyEncipherment');
     }
 
     /**
-     * @param array $domain
+     * @param string $domain
      * @return mixed|string
      */
-    protected function getChallengeToken(array $domain)
+    protected function getChallengeToken($domain)
     {
-        $this->log("Requesting challenge for ${domain['name']}");
+        $this->log("Requesting challenge for ${domain}");
 
         $response = $this->signedRequest(
             "/acme/new-authz",
-            ["resource" => "new-authz", "identifier" => ["type" => "dns", "value" => $domain['name']]]
+            ["resource" => "new-authz", "identifier" => ["type" => "dns", "value" => $domain]]
         );
 
         // choose http-01 challenge only
@@ -394,15 +387,15 @@ keyUsage = nonRepudiation, digitalSignature, keyEncipherment');
             return $v ? $v : ($w['type'] == 'http-01' ? $w : false);
         });
         if (!$challenge) {
-            throw new \RuntimeException("HTTP Challenge for ${domain['name']} is not available. Whole response: " . json_encode($response));
+            throw new \RuntimeException("HTTP Challenge for ${domain} is not available. Whole response: " . json_encode($response));
         }
 
-        $this->log("Got challenge token for ${domain['name']}");
+        $this->log("Got challenge token for ${domain}");
 
         return $response;
     }
 
-    protected function uploadToken(array $domain, $token)
+    protected function uploadToken($domain, $token)
     {
         $privateAccountKey = $this->readPrivateKey($this->accountKeyPath);
         $accountKeyDetails = openssl_pkey_get_details($privateAccountKey);
@@ -427,15 +420,15 @@ keyUsage = nonRepudiation, digitalSignature, keyEncipherment');
 
         $this->fileClient->writeContent($tokenPath, $payload);
 
-        $uri = "http://${domain['name']}/" . self::CHALLENGE_URL . "/${token}";
-        $this->log("Token for ${domain['name']} saved at $tokenPath and should be available at $uri");
+        $uri = "http://${domain}/" . self::CHALLENGE_URL . "/${token}";
+        $this->log("Token for ${domain} saved at $tokenPath and should be available at $uri");
 
         return $payload;
     }
 
     protected function requestCertificate(array $domains, $reuseCsr)
     {
-        $domainPath = $this->getDomainPath(reset($domains)['name']);
+        $domainPath = $this->getDomainPath(reset($domains));
 
         // generate private key for domain if not exist
         try {
@@ -468,7 +461,7 @@ keyUsage = nonRepudiation, digitalSignature, keyEncipherment');
 
     protected function saveCertificates(array $domains, $certificates)
     {
-        $domainPath = $this->getDomainPath(reset($domains)['name']);
+        $domainPath = $this->getDomainPath(reset($domains));
 
         $this->log("Saving fullchain.pem");
         $this->fileClient->writeContent($domainPath . '/fullchain.pem', implode("\n", $certificates));
@@ -480,9 +473,9 @@ keyUsage = nonRepudiation, digitalSignature, keyEncipherment');
         $this->fileClient->writeContent($domainPath . "/chain.pem", implode("\n", $certificates));
     }
 
-    protected function verifyDomainToken(array $domain, $token, $response)
+    protected function verifyDomainToken($domain, $token, $response)
     {
-        $uri = "http://${domain['name']}/" . self::CHALLENGE_URL . "/${token}";
+        $uri = "http://${domain}/" . self::CHALLENGE_URL . "/${token}";
 
         if ($response !== trim(@file_get_contents($uri))) {
             throw new \RuntimeException("Please check $uri - token not available");
@@ -490,12 +483,12 @@ keyUsage = nonRepudiation, digitalSignature, keyEncipherment');
         return true;
     }
 
-    protected function removeToken(array $domain, $token)
+    protected function removeToken($domain, $token)
     {
         $tokenPath = $this->webRootDir . self::CHALLENGE_URL . '/' . $token;
 
         $this->fileClient->removeFile($tokenPath);
 
-        $this->log("Token for ${domain['name']} removed from $tokenPath");
+        $this->log("Token for ${domain} removed from $tokenPath");
     }
 }
