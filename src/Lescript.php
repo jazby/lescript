@@ -4,7 +4,7 @@ namespace Jazby\Lescript;
 class Lescript
 {
     const CHALLENGE_URL = '.well-known/acme-challenge';
-
+    const MAX_ATTEMPTS_LOOP_LIMIT = 60;
     public $ca = 'https://acme-v01.api.letsencrypt.org';
     // public $ca = 'https://acme-staging.api.letsencrypt.org'; // testing
     public $license = 'https://letsencrypt.org/documents/LE-SA-v1.0.1-July-27-2015.pdf';
@@ -104,7 +104,11 @@ class Lescript
             );
 
             // waiting loop
+            $i = 0;
             do {
+                if (++$i >= self::MAX_ATTEMPTS_LOOP_LIMIT) {
+                    throw new \RuntimeException("Verification ended with error: Max try limit reached");
+                }
                 if (empty($result['status']) || $result['status'] == "invalid") {
                     throw new \RuntimeException("Verification ended with error: " . json_encode($result));
                 }
@@ -129,15 +133,14 @@ class Lescript
 
         // requesting certificate
         // ----------------------
-        $result = $this->requestCertificate($domains, $reuseCsr);
-        if ($this->client->getLastCode() !== 201) {
-            throw new \RuntimeException("Invalid response code: " . $this->client->getLastCode() . ", " . json_encode($result));
-        }
+        $this->requestCertificate($domains, $reuseCsr);
+
         $location = $this->client->getLastLocation();
 
         // waiting loop
         $certificates = [];
-        while (1) {
+        $i = 0;
+        while (true) {
             $this->client->getLastLinks();
 
             $result = $this->client->get($location);
@@ -146,24 +149,26 @@ class Lescript
 
                 $this->log("Certificate generation pending, sleeping 1s");
                 sleep(1);
-            } else {
-                if ($this->client->getLastCode() == 200) {
-
-                    $this->log("Got certificate! YAY!");
-                    $certificates[] = $this->parsePemFromBody($result);
-
-                    foreach ($this->client->getLastLinks() as $link) {
-                        $this->log("Requesting chained cert at $link");
-                        $result = $this->client->get($link);
-                        $certificates[] = $this->parsePemFromBody($result);
-                    }
-
-                    break;
-                } else {
-
-                    throw new \RuntimeException("Can't get certificate: HTTP code " . $this->client->getLastCode());
-                }
+                continue;
             }
+            if ($this->client->getLastCode() == 200) {
+
+                $this->log("Got certificate! YAY!");
+                $certificates[] = $this->parsePemFromBody($result);
+
+                foreach ($this->client->getLastLinks() as $link) {
+                    $this->log("Requesting chained cert at $link");
+                    $result = $this->client->get($link);
+                    $certificates[] = $this->parsePemFromBody($result);
+                }
+
+                break;
+            }
+            if (++$i >= self::MAX_ATTEMPTS_LOOP_LIMIT) {
+                throw new \RuntimeException("Can't get certificate: Max try limit reached");
+            }
+
+            throw new \RuntimeException("Can't get certificate: HTTP code " . $this->client->getLastCode());
         }
 
         if (empty($certificates)) {
@@ -364,6 +369,11 @@ keyUsage = nonRepudiation, digitalSignature, keyEncipherment');
         $this->ca = $ca;
     }
 
+    public function enableTestEnvironment()
+    {
+        $this->setUrl('https://acme-staging.api.letsencrypt.org');
+    }
+
     /**
      * @param array $domain
      * @return mixed|string
@@ -442,10 +452,16 @@ keyUsage = nonRepudiation, digitalSignature, keyEncipherment');
             $this->generateCSR($privateDomainKey, $domains);
 
         // request certificates creation
-        return $this->signedRequest(
+        $result = $this->signedRequest(
             "/acme/new-cert",
             ['resource' => 'new-cert', 'csr' => $csr]
         );
+
+        if ($this->client->getLastCode() !== 201) {
+            throw new \RuntimeException("Invalid response code: " . $this->client->getLastCode() . ", " . json_encode($result));
+        }
+
+        return $result;
     }
 
     protected function saveCertificates(array $domains, $certificates)
