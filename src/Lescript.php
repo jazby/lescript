@@ -371,7 +371,7 @@ keyUsage = nonRepudiation, digitalSignature, keyEncipherment');
 
     /**
      * @param string $domain
-     * @return mixed|string
+     * @return array
      */
     protected function getChallengeToken($domain)
     {
@@ -392,7 +392,7 @@ keyUsage = nonRepudiation, digitalSignature, keyEncipherment');
 
         $this->log("Got challenge token for ${domain}");
 
-        return $response;
+        return $challenge;
     }
 
     protected function uploadToken($domain, $token)
