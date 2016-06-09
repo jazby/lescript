@@ -12,7 +12,7 @@ class Client
         $this->base = $base;
     }
 
-    private function curl($method, $url, $data = null)
+    protected function curl($method, $url, $data = null)
     {
         $headers = ['Accept: application/json', 'Content-Type: application/json'];
         $handle = curl_init();
